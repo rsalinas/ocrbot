@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram OCR Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__WORKDIR__
+EnvironmentFile=__ENVFILE__
+ExecStart=__PYTHON__ __RUNNER__
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
