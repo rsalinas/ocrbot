@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 bottoken.txt
+tests/images/
