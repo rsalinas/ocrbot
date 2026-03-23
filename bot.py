@@ -323,7 +323,13 @@ def build_application(token: str) -> Application:
         raise RuntimeError("L'executable 'tesseract' no està disponible en PATH")
 
     ocr_bot = OcrTelegramBot()
-    application = Application.builder().token(token).build()
+    application = (
+        Application.builder()
+        .token(token)
+        .get_updates_read_timeout(60)
+        .get_updates_connect_timeout(30)
+        .build()
+    )
 
     image_filter = filters.PHOTO | filters.Document.IMAGE
     application.add_handler(CommandHandler("start", start_handler))
@@ -338,7 +344,7 @@ def main() -> None:
         raise RuntimeError("Defineix TELEGRAM_BOT_TOKEN abans d'executar el bot")
 
     application = build_application(token)
-    application.run_polling(allowed_updates=Update.ALL_TYPES, read_timeout=60, connect_timeout=30)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
