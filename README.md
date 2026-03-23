@@ -2,6 +2,8 @@
 
 Bot en Python que rep imatges per Telegram, executa el binari `tesseract` instal.lat en el sistema i respon amb el text detectat.
 
+Consulta [CONTRIBUTING.md](CONTRIBUTING.md) per a les normes de treball del repositori.
+
 ## Requisits
 
 - Python 3.10 o superior
