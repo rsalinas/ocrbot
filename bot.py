@@ -28,8 +28,9 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 
 ALBUM_SETTLE_SECONDS = float(os.getenv("ALBUM_SETTLE_SECONDS", "1.2"))
-TESSERACT_TIMEOUT_SECONDS = int(os.getenv("TESSERACT_TIMEOUT_SECONDS", "60"))
+TESSERACT_TIMEOUT_SECONDS = int(os.getenv("TESSERACT_TIMEOUT_SECONDS", "120"))
 TESSERACT_LANG = os.getenv("TESSERACT_LANG")
+MAX_CONCURRENT_OCR = int(os.getenv("MAX_CONCURRENT_OCR", "2"))
 EMPTY_OCR_RESPONSE = "\u200b"
 MAX_TELEGRAM_BYTES = 4096
 
@@ -87,6 +88,7 @@ class OcrTelegramBot:
     def __init__(self) -> None:
         self.album_batches: dict[tuple[int, str], AlbumBatch] = {}
         self.album_lock = asyncio.Lock()
+        self._ocr_semaphore = asyncio.Semaphore(MAX_CONCURRENT_OCR)
 
     async def image_handler(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -184,38 +186,43 @@ class OcrTelegramBot:
         typing_task = asyncio.create_task(typing_loop())
 
         # Pre-download the first image before entering the loop so that
-        # inside the loop we can always overlap: OCR[i] || download[i+1].
+        # inside the loop we can always overlap: download[i+1] || OCR[i].
         next_dl_task: asyncio.Task = asyncio.create_task(
             self._download_image(messages[0], context)
         )
 
+        errors = 0
         try:
             for i, message in enumerate(messages):
                 image_path, tmp_dir, file_size = await next_dl_task
+                total_image_bytes += file_size
 
-                # Start OCR in a thread so the event loop stays free.
-                ocr_future = loop.run_in_executor(
-                    None, self._run_tesseract, image_path
-                )
-
-                # While OCR runs, kick off the next download.
+                # Kick off the next download immediately — runs in parallel
+                # while we wait for the OCR semaphore and while OCR executes.
                 if i + 1 < num_images:
                     next_dl_task = asyncio.create_task(
                         self._download_image(messages[i + 1], context)
                     )
 
                 try:
-                    text = await ocr_future
+                    async with self._ocr_semaphore:
+                        text = await loop.run_in_executor(
+                            None, self._run_tesseract, image_path
+                        )
+                    text = text.strip()
+                    total_chars += len(text)
+                    total_words += len(text.split()) if text else 0
+                    for chunk in split_message(text or EMPTY_OCR_RESPONSE):
+                        await context.bot.send_message(chat_id=chat_id, text=chunk)
+                except RuntimeError as exc:
+                    errors += 1
+                    LOGGER.error("OCR error (chat=%d img=%d): %s", chat_id, i + 1, exc)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"\u26a0\ufe0f Error processant imatge {i + 1}: {exc}",
+                    )
                 finally:
                     tmp_dir.cleanup()
-
-                text = text.strip()
-                total_image_bytes += file_size
-                total_chars += len(text)
-                total_words += len(text.split()) if text else 0
-
-                for chunk in split_message(text or EMPTY_OCR_RESPONSE):
-                    await context.bot.send_message(chat_id=chat_id, text=chunk)
         finally:
             stop_event.set()
             await typing_task
@@ -224,7 +231,8 @@ class OcrTelegramBot:
         avg_per_image = elapsed / num_images if num_images else 0.0
         stats = (
             f"Estadístiques\n"
-            f"Imatges processades: {num_images}\n"
+            f"Imatges processades: {num_images}"
+            + (f" ({errors} errors)" if errors else "") + "\n"
             f"Bytes rebuts (imatges): {total_image_bytes:,}\n"
             f"Caràcters retornats: {total_chars:,}\n"
             f"Paraules retornades: {total_words:,}\n"
@@ -270,13 +278,18 @@ class OcrTelegramBot:
         if TESSERACT_LANG:
             command.extend(["-l", TESSERACT_LANG])
 
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=TESSERACT_TIMEOUT_SECONDS,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=TESSERACT_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"Tesseract timeout (>{TESSERACT_TIMEOUT_SECONDS} s)"
+            )
 
         if result.returncode not in (0, 1):
             stderr = result.stderr.strip() or "unknown error"
