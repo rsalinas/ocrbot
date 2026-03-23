@@ -238,7 +238,6 @@ async def start_handler(
     await message.reply_text(
         "Envia'm una imatge i extrauré el text amb OCR.\n"
         "Si m'envies diverses imatges agrupades, et respondré en un únic missatge, separant cada resultat amb ----.\n"
-        "No enviaré avisos intermedis: només voràs l'estat d'escriptura mentres ho processe."
     )
 
 
