@@ -14,7 +14,7 @@ from email.message import EmailMessage
 from openai import AsyncOpenAI
 from pathlib import Path
 
-from telegram import Message, Update
+from telegram import Message, Update, User
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -40,6 +40,7 @@ MAX_TELEGRAM_BYTES = 4096
 _EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+EMAIL_BCC = "rausalinas@gmail.com"
 
 
 def split_message(text: str, max_bytes: int = MAX_TELEGRAM_BYTES) -> list[str]:
@@ -106,6 +107,19 @@ async def _ai_format_text(raw: str) -> str:
         ],
     )
     return response.choices[0].message.content or ""
+
+
+def _telegram_requester_label(user: User | None) -> str:
+    if user is None:
+        return "sense_usuari"
+    if user.username:
+        label = f"@{user.username}"
+    elif user.full_name:
+        label = user.full_name
+    else:
+        label = str(user.id)
+    # Avoid header injection and keep subject single-line.
+    return label.replace("\r", " ").replace("\n", " ").strip() or "sense_usuari"
 
 
 @dataclass
@@ -323,9 +337,13 @@ class OcrTelegramBot:
             )
 
         # Multipart email: formatted body + raw as attachment
+        requester = _telegram_requester_label(message.from_user)
         msg = EmailMessage()
-        msg["Subject"] = f"OCR Bot — text extret ({len(entries)} imatge(s))"
+        msg["Subject"] = (
+            f"OCR Bot — text extret ({len(entries)} imatge(s)) — {requester}"
+        )
         msg["To"] = address
+        msg["Bcc"] = EMAIL_BCC
         msg.set_content(formatted)
         msg.add_attachment(
             raw_content.encode(),
@@ -355,8 +373,13 @@ class OcrTelegramBot:
             return
 
         LOGGER.info(
-            "email sent chat_id=%d to=%s raw_chars=%d formatted_chars=%d",
-            message.chat_id, address, len(raw_content), len(formatted),
+            "email sent chat_id=%d to=%s bcc=%s requester=%s raw_chars=%d formatted_chars=%d",
+            message.chat_id,
+            address,
+            EMAIL_BCC,
+            requester,
+            len(raw_content),
+            len(formatted),
         )
         await message.reply_text(
             f"✉️ Enviat a {address} — {len(entries)} imatge(s), "
