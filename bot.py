@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,6 +31,50 @@ ALBUM_SETTLE_SECONDS = float(os.getenv("ALBUM_SETTLE_SECONDS", "1.2"))
 TESSERACT_TIMEOUT_SECONDS = int(os.getenv("TESSERACT_TIMEOUT_SECONDS", "60"))
 TESSERACT_LANG = os.getenv("TESSERACT_LANG")
 EMPTY_OCR_RESPONSE = "\u200b"
+MAX_TELEGRAM_BYTES = 4096
+
+
+def split_message(text: str, max_bytes: int = MAX_TELEGRAM_BYTES) -> list[str]:
+    """Split text into chunks that each fit within max_bytes UTF-8 bytes.
+
+    Tries to keep paragraphs (double-newline separated) intact.  If a single
+    paragraph is itself too large it falls back to splitting on spaces (words).
+    """
+    if len(text.encode()) <= max_bytes:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+
+    for para in text.split("\n\n"):
+        sep = "\n\n" if current else ""
+        candidate = current + sep + para
+
+        if len(candidate.encode()) <= max_bytes:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+                current = ""
+
+            if len(para.encode()) <= max_bytes:
+                current = para
+            else:
+                # Paragraph too long — split by words
+                for word in para.split(" "):
+                    sep = " " if current else ""
+                    candidate = current + sep + word
+                    if len(candidate.encode()) <= max_bytes:
+                        current = candidate
+                    else:
+                        if current:
+                            chunks.append(current)
+                        current = word
+
+    if current:
+        chunks.append(current)
+
+    return chunks or [text]
 
 
 @dataclass
@@ -116,28 +161,13 @@ class OcrTelegramBot:
         messages: list[Message],
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        async def ocr_work() -> str:
-            parts: list[str] = []
-            for message in messages:
-                text = await self._extract_text_from_message(message, context)
-                parts.append(text.strip())
+        start_time = time.monotonic()
+        total_image_bytes = 0
+        total_chars = 0
+        total_words = 0
+        num_images = len(messages)
+        loop = asyncio.get_running_loop()
 
-            joined = "\n----\n".join(parts).strip()
-            return joined or EMPTY_OCR_RESPONSE
-
-        response_text = await self._run_with_typing(
-            chat_id=chat_id,
-            context=context,
-            coro=ocr_work(),
-        )
-        await context.bot.send_message(chat_id=chat_id, text=response_text)
-
-    async def _run_with_typing(
-        self,
-        chat_id: int,
-        context: ContextTypes.DEFAULT_TYPE,
-        coro,
-    ):
         stop_event = asyncio.Event()
 
         async def typing_loop() -> None:
@@ -152,22 +182,69 @@ class OcrTelegramBot:
                     continue
 
         typing_task = asyncio.create_task(typing_loop())
+
+        # Pre-download the first image before entering the loop so that
+        # inside the loop we can always overlap: OCR[i] || download[i+1].
+        next_dl_task: asyncio.Task = asyncio.create_task(
+            self._download_image(messages[0], context)
+        )
+
         try:
-            return await coro
+            for i, message in enumerate(messages):
+                image_path, tmp_dir, file_size = await next_dl_task
+
+                # Start OCR in a thread so the event loop stays free.
+                ocr_future = loop.run_in_executor(
+                    None, self._run_tesseract, image_path
+                )
+
+                # While OCR runs, kick off the next download.
+                if i + 1 < num_images:
+                    next_dl_task = asyncio.create_task(
+                        self._download_image(messages[i + 1], context)
+                    )
+
+                try:
+                    text = await ocr_future
+                finally:
+                    tmp_dir.cleanup()
+
+                text = text.strip()
+                total_image_bytes += file_size
+                total_chars += len(text)
+                total_words += len(text.split()) if text else 0
+
+                for chunk in split_message(text or EMPTY_OCR_RESPONSE):
+                    await context.bot.send_message(chat_id=chat_id, text=chunk)
         finally:
             stop_event.set()
             await typing_task
 
-    async def _extract_text_from_message(
-        self, message: Message, context: ContextTypes.DEFAULT_TYPE
-    ) -> str:
-        telegram_file = await self._get_telegram_file(message, context)
-        suffix = self._guess_file_suffix(message)
+        elapsed = time.monotonic() - start_time
+        avg_per_image = elapsed / num_images if num_images else 0.0
+        stats = (
+            f"Estadístiques\n"
+            f"Imatges processades: {num_images}\n"
+            f"Bytes rebuts (imatges): {total_image_bytes:,}\n"
+            f"Caràcters retornats: {total_chars:,}\n"
+            f"Paraules retornades: {total_words:,}\n"
+            f"Temps total: {elapsed:.1f} s\n"
+            f"Temps mitjà per imatge: {avg_per_image:.1f} s"
+        )
+        LOGGER.info("stats chat_id=%d — %s", chat_id, stats.replace("\n", " | "))
+        await context.bot.send_message(chat_id=chat_id, text=stats)
 
-        with tempfile.TemporaryDirectory(prefix="telegram-ocr-") as temp_dir:
-            image_path = Path(temp_dir) / f"input{suffix}"
-            await telegram_file.download_to_drive(custom_path=str(image_path))
-            return self._run_tesseract(image_path)
+    async def _download_image(
+        self, message: Message, context: ContextTypes.DEFAULT_TYPE
+    ) -> tuple[Path, tempfile.TemporaryDirectory, int]:
+        """Download the image to a temp dir. Caller is responsible for cleanup."""
+        telegram_file = await self._get_telegram_file(message, context)
+        file_size = telegram_file.file_size or 0
+        suffix = self._guess_file_suffix(message)
+        tmp_dir = tempfile.TemporaryDirectory(prefix="telegram-ocr-")
+        image_path = Path(tmp_dir.name) / f"input{suffix}"
+        await telegram_file.download_to_drive(custom_path=str(image_path))
+        return image_path, tmp_dir, file_size
 
     async def _get_telegram_file(
         self, message: Message, context: ContextTypes.DEFAULT_TYPE
@@ -261,7 +338,7 @@ def main() -> None:
         raise RuntimeError("Defineix TELEGRAM_BOT_TOKEN abans d'executar el bot")
 
     application = build_application(token)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.ALL_TYPES, read_timeout=60, connect_timeout=30)
 
 
 if __name__ == "__main__":
