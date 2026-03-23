@@ -134,6 +134,10 @@ class OcrTelegramBot:
         self.album_batches: dict[tuple[int, str], AlbumBatch] = {}
         self.album_lock = asyncio.Lock()
         self._ocr_semaphore = asyncio.Semaphore(MAX_CONCURRENT_OCR)
+        # Per-chat lock: serializes album processing within the same chat so
+        # results always arrive in the original order even when Telegram splits
+        # a large send into multiple consecutive albums.
+        self._chat_locks: dict[int, asyncio.Lock] = {}
         # Per-user accumulated OCR texts (chat_id -> list of extracted strings)
         self._user_buffers: dict[int, list[str]] = {}
         # Per-user default email address
@@ -207,6 +211,16 @@ class OcrTelegramBot:
         )
 
     async def _process_and_reply(
+        self,
+        chat_id: int,
+        messages: list[Message],
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        chat_lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
+        async with chat_lock:
+            await self._process_and_reply_locked(chat_id, messages, context)
+
+    async def _process_and_reply_locked(
         self,
         chat_id: int,
         messages: list[Message],
