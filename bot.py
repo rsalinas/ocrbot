@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import io
 import logging
 import os
 import shutil
@@ -89,6 +90,8 @@ class OcrTelegramBot:
         self.album_batches: dict[tuple[int, str], AlbumBatch] = {}
         self.album_lock = asyncio.Lock()
         self._ocr_semaphore = asyncio.Semaphore(MAX_CONCURRENT_OCR)
+        # Per-user accumulated OCR texts (chat_id -> list of extracted strings)
+        self._user_buffers: dict[int, list[str]] = {}
 
     async def image_handler(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -212,6 +215,8 @@ class OcrTelegramBot:
                     text = text.strip()
                     total_chars += len(text)
                     total_words += len(text.split()) if text else 0
+                    if text:
+                        self._user_buffers.setdefault(chat_id, []).append(text)
                     for chunk in split_message(text or EMPTY_OCR_RESPONSE):
                         await context.bot.send_message(chat_id=chat_id, text=chunk)
                 except RuntimeError as exc:
@@ -241,6 +246,35 @@ class OcrTelegramBot:
         )
         LOGGER.info("stats chat_id=%d — %s", chat_id, stats.replace("\n", " | "))
         await context.bot.send_message(chat_id=chat_id, text=stats)
+
+    async def reset_handler(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        message = update.effective_message
+        if message is None:
+            return
+        self._user_buffers.pop(message.chat_id, None)
+        await message.reply_text("Buffer buidat. Pots enviar noves imatges.")
+
+    async def get_handler(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        message = update.effective_message
+        if message is None:
+            return
+        entries = self._user_buffers.pop(message.chat_id, None)
+        if not entries:
+            await message.reply_text("No hi ha text acumulat. Envia'm imatges primer.")
+            return
+        content = "\n\n----\n\n".join(entries)
+        buf = io.BytesIO(content.encode())
+        buf.name = "ocr.txt"
+        await context.bot.send_document(
+            chat_id=message.chat_id,
+            document=buf,
+            filename="ocr.txt",
+            caption=f"{len(entries)} imatge(s) · {len(content):,} caràcters · {len(content.split()):,} paraules",
+        )
 
     async def _download_image(
         self, message: Message, context: ContextTypes.DEFAULT_TYPE
@@ -327,7 +361,9 @@ async def start_handler(
 
     await message.reply_text(
         "Envia'm una imatge i extrauré el text amb OCR.\n"
-        "Si m'envies diverses imatges agrupades, et respondré en un únic missatge, separant cada resultat amb ----.\n"
+        "Les imatges agrupades es processen juntes.\n\n"
+        "/get — baixa tot el text acumulat com a fitxer .txt (i buida el buffer)\n"
+        "/reset — buida el buffer sense descarregar res\n"
     )
 
 
@@ -346,6 +382,8 @@ def build_application(token: str) -> Application:
 
     image_filter = filters.PHOTO | filters.Document.IMAGE
     application.add_handler(CommandHandler("start", start_handler))
+    application.add_handler(CommandHandler("reset", ocr_bot.reset_handler))
+    application.add_handler(CommandHandler("get", ocr_bot.get_handler))
     application.add_handler(MessageHandler(image_filter, ocr_bot.image_handler))
     application.add_error_handler(error_handler)
     return application
