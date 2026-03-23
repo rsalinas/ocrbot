@@ -95,6 +95,8 @@ class OcrTelegramBot:
         self._ocr_semaphore = asyncio.Semaphore(MAX_CONCURRENT_OCR)
         # Per-user accumulated OCR texts (chat_id -> list of extracted strings)
         self._user_buffers: dict[int, list[str]] = {}
+        # Per-user default email address
+        self._user_emails: dict[int, str] = {}
 
     async def image_handler(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -409,18 +411,30 @@ async def error_handler(
 
 
 async def start_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    ocr_bot: "OcrTelegramBot | None" = None,
 ) -> None:
     message = update.effective_message
     if message is None:
         return
 
+    email_notice = ""
+    if context.args:
+        candidate = context.args[0]
+        if "@" in candidate:
+            if _EMAIL_RE.match(candidate) and ocr_bot is not None:
+                ocr_bot._user_emails[message.chat_id] = candidate
+                email_notice = f"\nAdreça desada: {candidate}"
+            else:
+                email_notice = "\n⚠️ Adreça de correu no vàlida, no s'ha desat."
+
     await message.reply_text(
         "Envia'm una imatge i extrauré el text amb OCR.\n"
         "Les imatges agrupades es processen juntes.\n\n"
         "/get — baixa tot el text acumulat com a fitxer .txt (i buida el buffer)\n"
-        "/email addr — envia el text acumulat per correu\n"
-        "/reset — buida el buffer sense descarregar res\n"
+        "/email [addr] — envia el text acumulat per correu\n"
+        "/reset — buida el buffer sense descarregar res"
+        + email_notice
     )
 
 
@@ -438,7 +452,7 @@ def build_application(token: str) -> Application:
     )
 
     image_filter = filters.PHOTO | filters.Document.IMAGE
-    application.add_handler(CommandHandler("start", start_handler))
+    application.add_handler(CommandHandler("start", lambda u, c: start_handler(u, c, ocr_bot)))
     application.add_handler(CommandHandler("reset", ocr_bot.reset_handler))
     application.add_handler(CommandHandler("get", ocr_bot.get_handler))
     application.add_handler(CommandHandler("email", ocr_bot.email_handler))
