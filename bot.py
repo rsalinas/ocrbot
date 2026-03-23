@@ -11,6 +11,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from email.message import EmailMessage
+from openai import AsyncOpenAI
 from pathlib import Path
 
 from telegram import Message, Update
@@ -37,6 +38,8 @@ MAX_CONCURRENT_OCR = int(os.getenv("MAX_CONCURRENT_OCR", "2"))
 EMPTY_OCR_RESPONSE = "\u200b"
 MAX_TELEGRAM_BYTES = 4096
 _EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 def split_message(text: str, max_bytes: int = MAX_TELEGRAM_BYTES) -> list[str]:
@@ -82,8 +85,32 @@ def split_message(text: str, max_bytes: int = MAX_TELEGRAM_BYTES) -> list[str]:
     return chunks or [text]
 
 
+async def _ai_format_text(raw: str) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY no definida")
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    response = await client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Ets un editor de textos. El text que t'envio ha estat extret "
+                    "de diverses imatges escanejades per parts mitjançant OCR. "
+                    "Pot contenir errors, espais trencats, paràgrafs tallats o altres "
+                    "artefactes d'OCR. Neteja i formata el text mantenint tot el contingut "
+                    "original. Retorna únicament el text net, sense explicacions addicionals."
+                ),
+            },
+            {"role": "user", "content": raw},
+        ],
+    )
+    return response.choices[0].message.content or ""
+
+
 @dataclass
 class AlbumBatch:
+
     messages: list[Message] = field(default_factory=list)
     job_name: str | None = None
 
@@ -259,29 +286,56 @@ class OcrTelegramBot:
         if message is None:
             return
 
-        if not context.args:
-            await message.reply_text("Ús: /email adreça@exemple.com")
-            return
-
-        address = context.args[0]
-        if not _EMAIL_RE.match(address):
-            await message.reply_text("Adreça de correu no vàlida.")
-            return
+        # Resolve address: explicit arg > saved address
+        if context.args and "@" in context.args[0]:
+            address = context.args[0]
+            if not _EMAIL_RE.match(address):
+                await message.reply_text("Adreça de correu no vàlida.")
+                return
+            self._user_emails[message.chat_id] = address
+        else:
+            address = self._user_emails.get(message.chat_id)
+            if not address:
+                await message.reply_text(
+                    "No tinc cap adreça desada. Usa:\n/email adreça@exemple.com"
+                )
+                return
 
         entries = self._user_buffers.get(message.chat_id)
         if not entries:
             await message.reply_text("No hi ha text acumulat. Envia'm imatges primer.")
             return
 
-        content = "\n\n----\n\n".join(entries)
+        raw_content = "\n\n----\n\n".join(entries)
 
+        await message.reply_text(
+            f"⏳ Formatejant {len(entries)} imatge(s) amb IA i enviant a {address}…"
+        )
+
+        # AI formatting (fallback to raw if OpenAI fails)
+        try:
+            formatted = await _ai_format_text(raw_content)
+        except Exception as exc:
+            LOGGER.error("OpenAI error (chat=%d): %s", message.chat_id, exc)
+            formatted = raw_content
+            await message.reply_text(
+                f"⚠️ Error de la IA, s'envia el text sense formatejar: {exc}"
+            )
+
+        # Multipart email: formatted body + raw as attachment
         msg = EmailMessage()
-        msg["Subject"] = "OCR Bot — text extret"
+        msg["Subject"] = f"OCR Bot — text extret ({len(entries)} imatge(s))"
         msg["To"] = address
-        msg.set_content(content)
+        msg.set_content(formatted)
+        msg.add_attachment(
+            raw_content.encode(),
+            maintype="text",
+            subtype="plain",
+            filename="ocr_brut.txt",
+        )
 
         try:
-            result = subprocess.run(
+            subprocess.run(
                 ["sendmail", "-t"],
                 input=msg.as_bytes(),
                 capture_output=True,
@@ -289,20 +343,24 @@ class OcrTelegramBot:
                 check=True,
             )
         except FileNotFoundError:
-            await message.reply_text("\u26a0\ufe0f Error: sendmail no est\u00e0 disponible en aquest servidor.")
+            await message.reply_text("⚠️ Error: sendmail no està disponible en aquest servidor.")
             return
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr.decode(errors="replace").strip()
             LOGGER.error("sendmail failed (chat=%d): %s", message.chat_id, stderr)
-            await message.reply_text(f"\u26a0\ufe0f Error enviant el correu: {stderr[:200]}")
+            await message.reply_text(f"⚠️ Error enviant el correu: {stderr[:200]}")
             return
         except subprocess.TimeoutExpired:
-            await message.reply_text("\u26a0\ufe0f Timeout en\'viant el correu via sendmail.")
+            await message.reply_text("⚠️ Timeout enviant el correu via sendmail.")
             return
 
-        LOGGER.info("email sent chat_id=%d to=%s chars=%d", message.chat_id, address, len(content))
+        LOGGER.info(
+            "email sent chat_id=%d to=%s raw_chars=%d formatted_chars=%d",
+            message.chat_id, address, len(raw_content), len(formatted),
+        )
         await message.reply_text(
-            f"\u2709\ufe0f Enviat a {address} \u2014 {len(entries)} imatge(s), {len(content):,} car\u00e0cters."
+            f"✉️ Enviat a {address} — {len(entries)} imatge(s), "
+            f"{len(raw_content):,} caràcters (brut) / {len(formatted):,} (formatejat)."
         )
 
     async def reset_handler(
