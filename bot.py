@@ -4,11 +4,13 @@ import asyncio
 import io
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from email.message import EmailMessage
 from pathlib import Path
 
 from telegram import Message, Update
@@ -34,6 +36,7 @@ TESSERACT_LANG = os.getenv("TESSERACT_LANG")
 MAX_CONCURRENT_OCR = int(os.getenv("MAX_CONCURRENT_OCR", "2"))
 EMPTY_OCR_RESPONSE = "\u200b"
 MAX_TELEGRAM_BYTES = 4096
+_EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 
 
 def split_message(text: str, max_bytes: int = MAX_TELEGRAM_BYTES) -> list[str]:
@@ -247,6 +250,59 @@ class OcrTelegramBot:
         LOGGER.info("stats chat_id=%d — %s", chat_id, stats.replace("\n", " | "))
         await context.bot.send_message(chat_id=chat_id, text=stats)
 
+    async def email_handler(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        message = update.effective_message
+        if message is None:
+            return
+
+        if not context.args:
+            await message.reply_text("Ús: /email adreça@exemple.com")
+            return
+
+        address = context.args[0]
+        if not _EMAIL_RE.match(address):
+            await message.reply_text("Adreça de correu no vàlida.")
+            return
+
+        entries = self._user_buffers.get(message.chat_id)
+        if not entries:
+            await message.reply_text("No hi ha text acumulat. Envia'm imatges primer.")
+            return
+
+        content = "\n\n----\n\n".join(entries)
+
+        msg = EmailMessage()
+        msg["Subject"] = "OCR Bot — text extret"
+        msg["To"] = address
+        msg.set_content(content)
+
+        try:
+            result = subprocess.run(
+                ["sendmail", "-t"],
+                input=msg.as_bytes(),
+                capture_output=True,
+                timeout=30,
+                check=True,
+            )
+        except FileNotFoundError:
+            await message.reply_text("\u26a0\ufe0f Error: sendmail no est\u00e0 disponible en aquest servidor.")
+            return
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode(errors="replace").strip()
+            LOGGER.error("sendmail failed (chat=%d): %s", message.chat_id, stderr)
+            await message.reply_text(f"\u26a0\ufe0f Error enviant el correu: {stderr[:200]}")
+            return
+        except subprocess.TimeoutExpired:
+            await message.reply_text("\u26a0\ufe0f Timeout en\'viant el correu via sendmail.")
+            return
+
+        LOGGER.info("email sent chat_id=%d to=%s chars=%d", message.chat_id, address, len(content))
+        await message.reply_text(
+            f"\u2709\ufe0f Enviat a {address} \u2014 {len(entries)} imatge(s), {len(content):,} car\u00e0cters."
+        )
+
     async def reset_handler(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -363,6 +419,7 @@ async def start_handler(
         "Envia'm una imatge i extrauré el text amb OCR.\n"
         "Les imatges agrupades es processen juntes.\n\n"
         "/get — baixa tot el text acumulat com a fitxer .txt (i buida el buffer)\n"
+        "/email addr — envia el text acumulat per correu\n"
         "/reset — buida el buffer sense descarregar res\n"
     )
 
@@ -384,6 +441,7 @@ def build_application(token: str) -> Application:
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("reset", ocr_bot.reset_handler))
     application.add_handler(CommandHandler("get", ocr_bot.get_handler))
+    application.add_handler(CommandHandler("email", ocr_bot.email_handler))
     application.add_handler(MessageHandler(image_filter, ocr_bot.image_handler))
     application.add_error_handler(error_handler)
     return application
